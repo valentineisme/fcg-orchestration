@@ -1,0 +1,296 @@
+services:
+
+  # =========================================================
+  # IDENTITY DATABASE
+  # =========================================================
+
+  postgres:
+    image: postgres:17
+    container_name: fcg-identity-postgres
+    environment:
+      POSTGRES_DB: fcg_identity
+      POSTGRES_USER: fcg_identity_app
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - identity_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fcg_identity_app -d fcg_identity"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+
+  # =========================================================
+  # IDENTITY MIGRATIONS
+  # =========================================================
+
+  identity-migrations:
+    build:
+      context: ../fcg-identity-service
+      dockerfile: Dockerfile
+      target: migrations
+      secrets:
+        - nuget_config
+
+    environment:
+      DOTNET_ENVIRONMENT: Development
+
+      IDENTITY_MIGRATIONS_CONNECTION: >-
+        Host=postgres;
+        Port=5432;
+        Database=fcg_identity;
+        Username=fcg_identity_app;
+        Password=postgres
+
+      # Em ambiente novo, já cria o web-bff preparado
+      # para Identity + Payments.
+
+      InitialServiceClient__AllowedAudiences__0: web-bff
+      InitialServiceClient__AllowedAudiences__1: identity-api
+      InitialServiceClient__AllowedAudiences__2: payments-api
+
+      InitialServiceClient__AllowedScopes__0: store.access
+      InitialServiceClient__AllowedScopes__1: identity.users.create
+      InitialServiceClient__AllowedScopes__2: identity.users.read
+      InitialServiceClient__AllowedScopes__3: identity.users.write
+      InitialServiceClient__AllowedScopes__4: identity.clients.create
+      InitialServiceClient__AllowedScopes__5: identity.clients.read
+      InitialServiceClient__AllowedScopes__6: identity.clients.write
+      InitialServiceClient__AllowedScopes__7: identity.audit.read
+      InitialServiceClient__AllowedScopes__8: payments.create
+      InitialServiceClient__AllowedScopes__9: payments.read
+      InitialServiceClient__AllowedScopes__10: payments.confirm
+      InitialServiceClient__AllowedScopes__11: payments.cancel
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    restart: "no"
+
+
+  # =========================================================
+  # IDENTITY API
+  # =========================================================
+
+  identity:
+    build:
+      context: ../fcg-identity-service
+      dockerfile: Dockerfile
+      target: final
+      secrets:
+        - nuget_config
+
+    container_name: fcg-identity
+
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_URLS: http://+:8080
+
+      ConnectionStrings__Database: >-
+        Host=postgres;
+        Port=5432;
+        Database=fcg_identity;
+        Username=fcg_identity_app;
+        Password=postgres
+
+    ports:
+      - "5081:8080"
+
+    depends_on:
+      identity-migrations:
+        condition: service_completed_successfully
+
+
+  # =========================================================
+  # PAYMENTS DATABASE
+  # =========================================================
+
+  payments-postgres:
+    image: postgres:17
+    container_name: fcg-payments-postgres
+
+    environment:
+      POSTGRES_DB: fcg_payments
+      POSTGRES_USER: fcg_payments_app
+      POSTGRES_PASSWORD: postgres
+
+    ports:
+      - "5433:5432"
+
+    volumes:
+      - payments_postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U fcg_payments_app -d fcg_payments"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+
+  # =========================================================
+  # PAYMENTS MIGRATIONS
+  # =========================================================
+
+  payments-migrations:
+    build:
+      context: ../fcg-payments-service
+      dockerfile: Dockerfile
+      target: migrations
+      secrets:
+        - nuget_config
+
+    environment:
+      DOTNET_ENVIRONMENT: Development
+
+      PAYMENTS_MIGRATIONS_CONNECTION: >-
+        Host=payments-postgres;
+        Port=5432;
+        Database=fcg_payments;
+        Username=fcg_payments_app;
+        Password=postgres
+
+    depends_on:
+      payments-postgres:
+        condition: service_healthy
+
+    restart: "no"
+
+
+  # =========================================================
+  # PAYMENTS API
+  # =========================================================
+
+  payments-api:
+    build:
+      context: ../fcg-payments-service
+      dockerfile: Dockerfile
+      target: final
+      secrets:
+        - nuget_config
+
+    container_name: fcg-payments-api
+
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_URLS: http://+:8080
+
+      ConnectionStrings__Database: >-
+        Host=payments-postgres;
+        Port=5432;
+        Database=fcg_payments;
+        Username=fcg_payments_app;
+        Password=postgres
+
+      Authentication__MetadataAddress: >-
+        http://identity:8080/.well-known/openid-configuration
+
+      Authentication__Issuer: fiap-cloud-games-identity
+      Authentication__Audience: payments-api
+      Authentication__RequireHttpsMetadata: "false"
+
+      FakePaymentProvider__ApprovalRate: "90"
+
+    ports:
+      - "5082:8080"
+
+    depends_on:
+      payments-migrations:
+        condition: service_completed_successfully
+
+      identity:
+        condition: service_started
+
+
+  # =========================================================
+  # RABBITMQ
+  # =========================================================
+
+  rabbitmq:
+    image: rabbitmq:4-management
+    container_name: fcg-rabbitmq
+
+    environment:
+      RABBITMQ_DEFAULT_USER: fcg
+      RABBITMQ_DEFAULT_PASS: fcg_dev
+
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+
+  # =========================================================
+  # PAYMENTS WORKER
+  # =========================================================
+
+  payments-worker:
+    build:
+      context: ../fcg-payments-service
+      dockerfile: Dockerfile
+      target: worker
+      secrets:
+        - nuget_config
+
+    container_name: fcg-payments-worker
+
+    environment:
+      DOTNET_ENVIRONMENT: Development
+
+      ConnectionStrings__Database: >-
+        Host=payments-postgres;
+        Port=5432;
+        Database=fcg_payments;
+        Username=fcg_payments_app;
+        Password=postgres
+
+      RabbitMq__Host: rabbitmq
+      RabbitMq__Port: "5672"
+      RabbitMq__Username: fcg
+      RabbitMq__Password: fcg_dev
+      RabbitMq__Exchange: fcg.events
+
+      Outbox__BatchSize: "20"
+      Outbox__PollingIntervalSeconds: "2"
+
+      FakePaymentProvider__ApprovalRate: "90"
+
+    depends_on:
+      payments-migrations:
+        condition: service_completed_successfully
+
+      rabbitmq:
+        condition: service_healthy
+
+
+# =========================================================
+# VOLUMES
+# =========================================================
+
+volumes:
+  identity_postgres_data:
+  payments_postgres_data:
+  rabbitmq_data:
+
+
+# =========================================================
+# BUILD SECRETS
+# =========================================================
+
+secrets:
+  nuget_config:
+    file: ./NuGet.Docker.Config

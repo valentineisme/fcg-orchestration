@@ -1,0 +1,4 @@
+NuGet.Docker.Config
+.env
+.env.*
+!.env.example
